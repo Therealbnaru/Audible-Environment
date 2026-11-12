@@ -1,4 +1,4 @@
-# SceneNarrator
+# Audible Environment
 
 SwiftUI iPhone prototype for Ray-Ban Meta glasses. The app logs device and camera stream state, counts incoming frames, and saves one stream frame to Photos every 10 seconds.
 
