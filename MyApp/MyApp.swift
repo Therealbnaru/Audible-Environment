@@ -94,7 +94,7 @@ struct MyApp: App {
                         .disabled(session == nil || sessionState == .stopping)
                     }
                 }
-                .navigationTitle("Scene Narrator")
+                .navigationTitle("Audible Environment")
             }
             .task {
                 guard sdkReady else { return }
