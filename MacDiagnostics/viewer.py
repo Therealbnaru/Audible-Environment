@@ -8,9 +8,6 @@ import secrets
 import subprocess
 import tempfile
 from threading import Lock, Thread
-import tkinter as tk
-from tkinter import messagebox
-from tkinter.scrolledtext import ScrolledText
 
 PORT = 8766
 CODE = secrets.token_urlsafe(12)
@@ -59,88 +56,43 @@ class Receiver(BaseHTTPRequestHandler):
         pass
 
 
-def thumbnail(data, directory, size):
-    source = directory / "frame.jpg"
-    target = directory / "frame.png"
-    source.write_bytes(data)
-    subprocess.run(["/usr/bin/sips", "-s", "format", "png", "-Z", str(size),
-                    str(source), "--out", str(target)],
-                   check=True, capture_output=True, timeout=2)
-    return tk.PhotoImage(file=str(target))
-
-
 def main():
-    root = tk.Tk()
-    root.title("Audible Environment Live Diagnostics")
-    root.geometry("1100x800")
-    hostname = subprocess.check_output(["/usr/sbin/scutil", "--get", "LocalHostName"], text=True).strip()
-    root.configure(bg="#eceff4")
-    connection = tk.Entry(root, width=72, fg="#172033", readonlybackground="#ffffff")
-    connection.insert(0, f"Mac hostname: {hostname}.local    Viewer code: {CODE}")
-    connection.configure(state="readonly")
-    connection.pack(pady=8)
-    feed = tk.LabelFrame(root, bg="#eceff4", fg="#172033", text="Live glasses view")
-    feed.pack(fill="x", padx=12, pady=4)
-    image_label = tk.Label(feed, bg="#ffffff", fg="#172033", text="Waiting for glasses frames…")
-    image_label.pack(pady=4)
-    sent = tk.LabelFrame(root, bg="#eceff4", fg="#172033", text="Frames sent to Gemini")
-    sent.pack(fill="x", padx=12, pady=4)
-    details = ScrolledText(root, wrap="word", state="disabled", height=12)
-    details.pack(fill="both", expand=True, padx=12, pady=8)
-    details.configure(bg="#ffffff", fg="#172033", state="normal")
-    details.insert("1.0", "Waiting for the first Gemini request…")
-    details.configure(state="disabled")
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", PORT), Receiver)
-    except OSError as error:
-        messagebox.showerror("Could not start the viewer", f"Port {PORT}: {error}")
-        root.destroy()
-        return
-    print(f"Mac hostname: {hostname}.local | Viewer code: {CODE}", flush=True)
-    Thread(target=server.serve_forever, daemon=True).start()
-    shown = {}
-    displayed_id = None
+    hostname = subprocess.check_output(
+        ["/usr/sbin/scutil", "--get", "LocalHostName"], text=True
+    ).strip()
+    with ThreadingHTTPServer(("0.0.0.0", PORT), Receiver) as server:
+        Thread(target=server.serve_forever, daemon=True).start()
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            metadata = directory / "exchange.json"
+            preview = directory / "preview.jpg"
+            def refresh():
+                shown = {}
+                while not stopped.wait(0.1):
+                    with lock:
+                        updates = latest.copy()
+                    for route, target in (("/preview", preview), ("/exchange", metadata)):
+                        value = updates.get(route)
+                        if value is None or value is shown.get(route):
+                            continue
+                        staging = target.with_suffix(".tmp")
+                        staging.write_bytes(value if route == "/preview" else json.dumps(value).encode())
+                        staging.replace(target)
+                        shown[route] = value
 
-    with tempfile.TemporaryDirectory() as temp:
-        directory = Path(temp)
-
-        def refresh():
-            nonlocal displayed_id
-            with lock:
-                updates = latest.copy()
+            from threading import Event
+            stopped = Event()
+            worker = Thread(target=refresh)
+            worker.start()
             try:
-                preview = updates.get("/preview")
-                if preview is not None and preview is not shown.get("/preview"):
-                    shown["/preview"] = preview
-                    image_label.image = thumbnail(preview, directory, 460)
-                    image_label.configure(image=image_label.image, text="")
-                exchange = updates.get("/exchange")
-                if exchange is not None and exchange is not shown.get("/exchange"):
-                    shown["/exchange"] = exchange
-                    if displayed_id != exchange["id"]:
-                        images = [thumbnail(base64.b64decode(frame, validate=True), directory, 220)
-                                  for frame in exchange["frames"]]
-                        for child in sent.winfo_children():
-                            child.destroy()
-                        for index, image in enumerate(images, 1):
-                            label = tk.Label(sent, bg="#ffffff", fg="#172033", text=f"Frame {index}", image=image, compound="top")
-                            label.image = image
-                            label.pack(side="left", padx=5, pady=4)
-                        displayed_id = exchange["id"]
-                    details.configure(state="normal")
-                    details.delete("1.0", "end")
-                    details.insert("1.0", f'PROMPT\n{exchange["prompt"]}\n\nGEMINI\n{exchange["response"]}')
-                    details.configure(state="disabled")
-            except (OSError, ValueError, TypeError, subprocess.SubprocessError, tk.TclError):
-                pass
-            root.after(100, refresh)
-
-        refresh()
-        try:
-            root.mainloop()
-        finally:
-            server.shutdown()
-            server.server_close()
+                subprocess.run(
+                    ["/usr/bin/swift", "-module-cache-path", str(directory / "module-cache"), str(Path(__file__).with_name("Viewer.swift")),
+                     str(directory), hostname + ".local", CODE], check=True
+                )
+            finally:
+                stopped.set()
+                worker.join()
+                server.shutdown()
 
 
 if __name__ == "__main__":
