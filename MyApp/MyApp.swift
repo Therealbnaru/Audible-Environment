@@ -1,3 +1,4 @@
+import UniformTypeIdentifiers
 import AVFoundation
 import CoreMedia
 import MWDATCamera
@@ -45,7 +46,14 @@ struct MyApp: App {
     @State private var isDescribing = false
     @State private var geminiExchange: GeminiExchange?
 
-    private struct GeminiExchange {
+    private struct GeminiExchange: Encodable, Transferable {
+        static var transferRepresentation: some TransferRepresentation {
+            DataRepresentation(exportedContentType: .json) { exchange in
+                try JSONEncoder().encode(exchange)
+            }
+            .suggestedFileName("Gemini Exchange")
+        }
+
         let frames: [Data]
         let prompt: String
         var response = "Waiting for Gemini…"
@@ -146,24 +154,9 @@ struct MyApp: App {
                         }
                     }
 
-                    Section("Diagnostics") {
-                        DisclosureGroup("Last Gemini exchange") {
-                            if let exchange = geminiExchange {
-                                ForEach(exchange.frames.indices, id: \.self) { index in
-                                    if let image = UIImage(data: exchange.frames[index]) {
-                                        Image(uiImage: image)
-                                            .resizable()
-                                            .scaledToFit()
-                                            .accessibilityLabel("Sent frame \(index + 1)")
-                                    }
-                                }
-                                Text("Prompt").font(.headline)
-                                Text(exchange.prompt).textSelection(.enabled)
-                                Text("Response").font(.headline)
-                                Text(exchange.response).textSelection(.enabled)
-                            } else {
-                                Text("Waiting for the first Gemini request.")
-                            }
+                    if let exchange = geminiExchange {
+                        ShareLink(item: exchange, preview: SharePreview("Gemini exchange")) {
+                            Label("Share Last Exchange", systemImage: "square.and.arrow.up")
                         }
                     }
 
