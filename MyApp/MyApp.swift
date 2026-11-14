@@ -392,7 +392,7 @@ struct MyApp: App {
                         }
                         if narrationFrames.count >= 3 && !isDescribing && !speechSynthesizer.isSpeaking &&
                             now >= max(geminiRetryAt, nextNarrationRequestAt) {
-                            if now < narrationSettlesAt {
+                            if !recentAnnouncements.isEmpty && now < narrationSettlesAt {
                                 narrationStatus = "Waiting for the view to settle…"
                             } else {
                                 let reference = previousNarrationFrame
@@ -404,7 +404,7 @@ struct MyApp: App {
                                     recentChanges[$0] >= 0.02
                                 }
                                 let sceneChange = reference.map { Self.frameChange($0, sample) } ?? 1
-                                if eventIndex != nil || sceneChange >= 0.02 {
+                                if recentAnnouncements.isEmpty || eventIndex != nil || sceneChange >= 0.02 {
                                     let sequence: [NarrationFrame]
                                     if let eventIndex {
                                         sequence = [samples[eventIndex], samples[eventIndex + 1], sample]
@@ -588,7 +588,15 @@ struct MyApp: App {
         Recent announcements:
         \(recentAnnouncements.joined(separator: "\n"))
         """
-        var parts: [[String: Any]] = [["text": narration == nil ? manualPrompt : narrationPrompt]]
+        let initialPrompt = """
+        Give a blind or low-vision listener a brief first description of the latest image.
+        Describe one visible object, person, action, or feature of the surroundings in at most ten words.
+        A still scene is expected. If the view is unusable, say why briefly, such as "The view is too dark."
+        Do not give navigation instructions.
+        """
+        let prompt = narration == nil ? manualPrompt :
+            (recentAnnouncements.isEmpty ? initialPrompt : narrationPrompt)
+        var parts: [[String: Any]] = [["text": prompt]]
         for frame in frames {
             parts.append(["inlineData": ["mimeType": "image/jpeg", "data": frame.base64EncodedString()]])
         }
@@ -636,7 +644,16 @@ struct MyApp: App {
                 previousNarrationFrame = reference
                 let words = description.split { !$0.isLetter && !$0.isNumber }
                 if !words.isEmpty && words.allSatisfy({ $0.uppercased() == "QUIET" }) {
-                    narrationStatus = "Gemini replied. Nothing new to announce."
+                    narrationStatus = recentAnnouncements.isEmpty
+                        ? "Waiting for an initial description…"
+                        : "Gemini replied. Nothing new to announce."
+                    return
+                }
+                let normalized = words.map { $0.lowercased() }
+                if recentAnnouncements.contains(where: {
+                    $0.split { !$0.isLetter && !$0.isNumber }.map { $0.lowercased() } == normalized
+                }) {
+                    narrationStatus = "Already announced."
                     return
                 }
                 guard words.count <= 10,
