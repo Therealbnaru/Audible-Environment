@@ -1,12 +1,3 @@
-Traceback (most recent call last):
-  File "<stdin>", line 42, in <module>
-  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/pathlib.py", line 1275, in write_text
-    with self.open(mode='w', encoding=encoding, errors=errors) as f:
-  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/pathlib.py", line 1242, in open
-    return io.open(self, mode, buffering, encoding, errors, newline,
-  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/pathlib.py", line 1110, in _opener
-    return self._accessor.open(self, flags, mode)
-PermissionError: [Errno 1] Operation not permitted: 'Audible Enviornment/MyApp.swift'
 import AVFoundation
 import CoreMedia
 import MWDATCamera
@@ -629,13 +620,13 @@ struct MyApp: App {
         Return exactly QUIET only when the view is unusable or the most useful current detail is already covered.
         A different object held up by the same person is a new detail.
         Ignore blur, lighting shifts, and head movement by itself. Describe only visible evidence.
-        Return a single phrase of at most ten words. Do not give navigation instructions.
+        Condense the most useful detail into one short sentence. Omit filler and navigation instructions.
         Recent announcements:
         \(recentAnnouncements.joined(separator: "\n"))
         """
         let initialPrompt = """
         Give a blind or low-vision listener a brief first description of the latest image.
-        Describe one visible object, person, action, or feature of the surroundings in at most ten words.
+        Describe one visible object, person, action, or feature of the surroundings in one short sentence.
         A still scene is expected. If the view is unusable, say why briefly, such as "The view is too dark."
         Do not give navigation instructions.
         """
@@ -708,8 +699,7 @@ struct MyApp: App {
                     narrationStatus = "Already announced."
                     return
                 }
-                guard words.count <= 10,
-                      let capturedAt,
+                guard let capturedAt,
                       !speechSynthesizer.isSpeaking else { return }
                 guard ProcessInfo.processInfo.systemUptime - capturedAt <= 12 else {
                     narrationStatus = "Gemini replied too late. Waiting for a fresh scene."
