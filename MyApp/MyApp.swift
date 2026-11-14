@@ -1,4 +1,3 @@
-import UniformTypeIdentifiers
 import AVFoundation
 import CoreMedia
 import MWDATCamera
@@ -44,20 +43,13 @@ struct MyApp: App {
     @State private var frameDescription: String?
     @State private var descriptionError: String?
     @State private var isDescribing = false
-    @State private var geminiExchange: GeminiExchange?
+    @AppStorage("diagnosticsHost") private var diagnosticsHost = ""
+    @State private var diagnosticsCode = ""
+    @State private var diagnosticsEnabled = false
+    @State private var nextPreviewAt: TimeInterval = 0
+    @State private var previewInFlight = false
+    @State private var diagnosticsError: String?
 
-    private struct GeminiExchange: Encodable, Transferable {
-        static var transferRepresentation: some TransferRepresentation {
-            DataRepresentation(exportedContentType: .json) { exchange in
-                try JSONEncoder().encode(exchange)
-            }
-            .suggestedFileName("Gemini Exchange")
-        }
-
-        let frames: [Data]
-        let prompt: String
-        var response = "Waiting for Gemini…"
-    }
     @State private var geminiRetryAt: TimeInterval = 0
     @State private var nextNarrationRequestAt: TimeInterval = 0
     @State private var nextSceneRecheckAt: TimeInterval = 0
@@ -154,9 +146,18 @@ struct MyApp: App {
                         }
                     }
 
-                    if let exchange = geminiExchange {
-                        ShareLink(item: exchange, preview: SharePreview("Gemini exchange")) {
-                            Label("Share Last Exchange", systemImage: "square.and.arrow.up")
+                    Section("Mac Viewer") {
+                        Toggle("Send Live Diagnostics", isOn: $diagnosticsEnabled)
+                        if diagnosticsEnabled {
+                            TextField("Mac hostname ending in .local", text: $diagnosticsHost)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            SecureField("Viewer code", text: $diagnosticsCode)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            if let diagnosticsError {
+                                Text(diagnosticsError).foregroundStyle(.red)
+                            }
                         }
                     }
 
@@ -382,6 +383,17 @@ struct MyApp: App {
 
                     let now = ProcessInfo.processInfo.systemUptime
                     guard streamState == .streaming, sessionState == .started else { return }
+                    if diagnosticsEnabled && !previewInFlight && now >= nextPreviewAt {
+                        nextPreviewAt = now + 0.25
+                        if let image = frame.makeUIImage(),
+                           let preview = image.jpegData(compressionQuality: 0.35) {
+                            previewInFlight = true
+                            Task {
+                                defer { previewInFlight = false }
+                                await sendDiagnostics(preview, kind: "preview", contentType: "image/jpeg")
+                            }
+                        }
+                    }
                     let snapshotDue = nextSnapshotAt.map { now >= $0 } ?? false
                     let narrationDue = narrationRun != nil &&
                         pendingCapture == nil && now >= nextNarrationFrameAt
@@ -625,14 +637,15 @@ struct MyApp: App {
             parts.append(["inlineData": ["mimeType": "image/jpeg", "data": frame.base64EncodedString()]])
         }
 
+        let exchangeID = UUID().uuidString
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: ["contents": [["parts": parts]]])
-            geminiExchange = GeminiExchange(frames: frames, prompt: prompt)
+            publishExchange(id: exchangeID, frames: frames, prompt: prompt, response: "Waiting for Gemini…")
             let (data, response) = try await URLSession.shared.data(for: request)
             let status = (response as? HTTPURLResponse).map { "HTTP \($0.statusCode)" } ?? "Response"
             let body = String(decoding: data, as: UTF8.self)
                 .replacingOccurrences(of: key, with: "[redacted]")
-            geminiExchange?.response = status + "\n" + body
+            publishExchange(id: exchangeID, frames: frames, prompt: prompt, response: status + "\n" + body)
             guard let http = response as? HTTPURLResponse else {
                 descriptionError = "Gemini returned an invalid response."
                 return
@@ -706,10 +719,44 @@ struct MyApp: App {
                 descriptionError = "The iPhone could not save the Gemini key in Keychain."
             }
         } catch {
-            geminiExchange?.response = error.localizedDescription.replacingOccurrences(of: key, with: "[redacted]")
+            publishExchange(id: exchangeID, frames: frames, prompt: prompt,
+                            response: error.localizedDescription.replacingOccurrences(of: key, with: "[redacted]"))
             if narration == nil || (narrationRun == narration && streamID == sourceStream) {
                 descriptionError = error.localizedDescription
             }
+        }
+    }
+
+    private func publishExchange(id: String, frames: [Data], prompt: String, response: String) {
+        guard diagnosticsEnabled else { return }
+        let payload: [String: Any] = [
+            "id": id, "frames": frames.map { $0.base64EncodedString() },
+            "prompt": prompt, "response": response
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        Task { await sendDiagnostics(data, kind: "exchange", contentType: "application/json") }
+    }
+
+    private func sendDiagnostics(_ data: Data, kind: String, contentType: String) async {
+        guard diagnosticsEnabled else { return }
+        let host = diagnosticsHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = diagnosticsCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard host.range(of: #"^[A-Za-z0-9-]+\.local$"#, options: .regularExpression) != nil,
+              !code.isEmpty, let url = URL(string: "http://\(host):8766/\(kind)") else {
+            diagnosticsError = "Enter the Mac hostname and viewer code."
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 3)
+        request.httpMethod = "POST"
+        request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(code)", forHTTPHeaderField: "Authorization")
+        request.httpBody = data
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            diagnosticsError = (response as? HTTPURLResponse)?.statusCode == 204
+                ? nil : "The Mac viewer rejected the connection. Check the viewer code."
+        } catch {
+            diagnosticsError = "Cannot reach the Mac viewer. Check Wi-Fi and Local Network access."
         }
     }
 
