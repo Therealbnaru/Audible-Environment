@@ -43,6 +43,13 @@ struct MyApp: App {
     @State private var frameDescription: String?
     @State private var descriptionError: String?
     @State private var isDescribing = false
+    @State private var geminiExchange: GeminiExchange?
+
+    private struct GeminiExchange {
+        let frames: [Data]
+        let prompt: String
+        var response = "Waiting for Gemini…"
+    }
     @State private var geminiRetryAt: TimeInterval = 0
     @State private var nextNarrationRequestAt: TimeInterval = 0
     @State private var nextSceneRecheckAt: TimeInterval = 0
@@ -136,6 +143,27 @@ struct MyApp: App {
                         if let descriptionError {
                             Text(descriptionError)
                                 .foregroundStyle(.red)
+                        }
+                    }
+
+                    Section("Diagnostics") {
+                        DisclosureGroup("Last Gemini exchange") {
+                            if let exchange = geminiExchange {
+                                ForEach(exchange.frames.indices, id: \.self) { index in
+                                    if let image = UIImage(data: exchange.frames[index]) {
+                                        Image(uiImage: image)
+                                            .resizable()
+                                            .scaledToFit()
+                                            .accessibilityLabel("Sent frame \(index + 1)")
+                                    }
+                                }
+                                Text("Prompt").font(.headline)
+                                Text(exchange.prompt).textSelection(.enabled)
+                                Text("Response").font(.headline)
+                                Text(exchange.response).textSelection(.enabled)
+                            } else {
+                                Text("Waiting for the first Gemini request.")
+                            }
                         }
                     }
 
@@ -606,7 +634,12 @@ struct MyApp: App {
 
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: ["contents": [["parts": parts]]])
+            geminiExchange = GeminiExchange(frames: frames, prompt: prompt)
             let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse).map { "HTTP \($0.statusCode)" } ?? "Response"
+            let body = String(decoding: data, as: UTF8.self)
+                .replacingOccurrences(of: key, with: "[redacted]")
+            geminiExchange?.response = status + "\n" + body
             guard let http = response as? HTTPURLResponse else {
                 descriptionError = "Gemini returned an invalid response."
                 return
@@ -680,6 +713,7 @@ struct MyApp: App {
                 descriptionError = "The iPhone could not save the Gemini key in Keychain."
             }
         } catch {
+            geminiExchange?.response = error.localizedDescription.replacingOccurrences(of: key, with: "[redacted]")
             if narration == nil || (narrationRun == narration && streamID == sourceStream) {
                 descriptionError = error.localizedDescription
             }
