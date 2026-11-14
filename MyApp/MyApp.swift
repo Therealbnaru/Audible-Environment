@@ -43,9 +43,9 @@ struct MyApp: App {
     @State private var frameDescription: String?
     @State private var descriptionError: String?
     @State private var isDescribing = false
-    @AppStorage("diagnosticsHost") private var diagnosticsHost = ""
-    @State private var diagnosticsCode = ""
-    @State private var diagnosticsEnabled = false
+    @AppStorage("diagnosticsHost") private var diagnosticsHost = MyApp.defaultViewerHost
+    @AppStorage("diagnosticsCode") private var diagnosticsCode = MyApp.localViewerCode
+    @AppStorage("diagnosticsEnabled") private var diagnosticsEnabled = !MyApp.localViewerCode.isEmpty
     @State private var nextPreviewAt: TimeInterval = 0
     @State private var previewInFlight = false
     @State private var diagnosticsError: String?
@@ -725,6 +725,16 @@ struct MyApp: App {
                 descriptionError = error.localizedDescription
             }
         }
+    }
+
+    private static var localViewerCode: String {
+        guard let url = Bundle.main.url(forResource: "LocalViewerCode", withExtension: "txt"),
+              let code = try? String(contentsOf: url, encoding: .utf8) else { return "" }
+        return code.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static var defaultViewerHost: String {
+        localViewerCode.isEmpty ? "" : "srilathas-macbook-air.local"
     }
 
     private func publishExchange(id: String, frames: [Data], prompt: String, response: String) {
