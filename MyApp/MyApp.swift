@@ -1,7 +1,9 @@
+import AVFoundation
 import CoreMedia
 import MWDATCamera
 import MWDATCore
 import Photos
+import Security
 import SwiftUI
 import UIKit
 
@@ -28,6 +30,23 @@ struct MyApp: App {
     @State private var photosAllowed = false
     @State private var photosSaved = 0
     @State private var nextSnapshotAt: TimeInterval?
+
+    @State private var geminiAPIKey = MyApp.defaultGeminiKey()
+    @State private var speechSynthesizer = AVSpeechSynthesizer()
+    @State private var pendingCapture: UUID?
+    @State private var narrationRun: UUID?
+    @State private var narrationSettlesAt: TimeInterval = 0
+    @State private var narrationFrames: [NarrationFrame] = []
+    @State private var previousNarrationFrame: NarrationFrame?
+    @State private var nextNarrationFrameAt: TimeInterval = 0
+    @State private var recentAnnouncements: [String] = []
+    @State private var frameDescription: String?
+    @State private var descriptionError: String?
+    @State private var isDescribing = false
+    @State private var geminiRetryAt: TimeInterval = 0
+    @State private var nextNarrationRequestAt: TimeInterval = 0
+    @State private var narrationStatus = "Collecting frames…"
+    @State private var geminiBackoff: TimeInterval = 60
 
     private let snapshotInterval: TimeInterval = 10
 
@@ -56,6 +75,65 @@ struct MyApp: App {
 
                         if let errorMessage {
                             Text(errorMessage)
+                                .foregroundStyle(.red)
+                        }
+                    }
+
+                    Section("Describe a frame") {
+                        Toggle("Automatic Narration", isOn: Binding(
+                            get: { narrationRun != nil },
+                            set: { enabled in
+                                narrationRun = enabled ? UUID() : nil
+                                narrationFrames.removeAll()
+                                narrationSettlesAt = 0
+                                previousNarrationFrame = nil
+                                recentAnnouncements.removeAll()
+                                nextNarrationFrameAt = 0
+                                narrationStatus = "Collecting frames…"
+                                if !enabled {
+                                    speechSynthesizer.stopSpeaking(at: .immediate)
+                                }
+                            }
+                        ))
+                        if narrationRun != nil && streamState != .streaming {
+                            Text("Start the glasses stream to begin narration.")
+                        } else if narrationRun != nil {
+                            Text(narrationStatus)
+                        }
+                        SecureField("Gemini API key", text: $geminiAPIKey)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button {
+                            requestDescription()
+                        } label: {
+                            Text("Describe Now")
+                                .frame(maxWidth: .infinity, minHeight: 64)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(streamState != .streaming || pendingCapture != nil || isDescribing)
+
+                        Button {
+                            if let frameDescription {
+                                speakDescription(frameDescription)
+                            }
+                        } label: {
+                            Text("Repeat Last Description")
+                                .frame(maxWidth: .infinity, minHeight: 64)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(frameDescription == nil || isDescribing)
+
+                        if pendingCapture != nil || isDescribing {
+                            ProgressView("Describing frame")
+                        }
+                        if let frameDescription {
+                            Text(frameDescription)
+                            Button("Stop Speaking") {
+                                speechSynthesizer.stopSpeaking(at: .immediate)
+                            }
+                        }
+                        if let descriptionError {
+                            Text(descriptionError)
                                 .foregroundStyle(.red)
                         }
                     }
@@ -230,6 +308,13 @@ struct MyApp: App {
             let id = UUID()
             camera = newCamera
             streamID = id
+            narrationFrames.removeAll()
+            narrationSettlesAt = 0
+            previousNarrationFrame = nil
+            recentAnnouncements.removeAll()
+            nextNarrationFrameAt = 0
+            frameDescription = nil
+            descriptionError = nil
             frameCount = 0
             photosSaved = 0
             nextSnapshotAt = nil
@@ -273,20 +358,73 @@ struct MyApp: App {
                     frameCount += 1
                     print("Frame \(frameCount) | received: \(receivedAt) | PTS: \(frameTime)s")
 
-                    // Only convert a frame to JPEG when it's time for a snapshot.
                     let now = ProcessInfo.processInfo.systemUptime
-                    guard photosAllowed, streamState == .streaming,
-                          sessionState == .started,
-                          let deadline = nextSnapshotAt, now >= deadline else { return }
+                    guard streamState == .streaming, sessionState == .started else { return }
+                    let snapshotDue = nextSnapshotAt.map { now >= $0 } ?? false
+                    let narrationDue = narrationRun != nil &&
+                        pendingCapture == nil && now >= nextNarrationFrameAt
+                    guard snapshotDue || pendingCapture != nil || narrationDue else { return }
 
-                    nextSnapshotAt = now + snapshotInterval
+                    if snapshotDue {
+                        nextSnapshotAt = now + snapshotInterval
+                    }
 
-                    guard let jpeg = frame.makeUIImage()?.jpegData(compressionQuality: 0.8) else {
+                    guard let image = frame.makeUIImage(),
+                          let jpeg = image.jpegData(compressionQuality: 0.8) else {
                         report("Couldn't convert the glasses frame to JPEG.")
                         return
                     }
 
-                    await savePhoto(jpeg, streamID: id)
+                    if pendingCapture != nil {
+                        pendingCapture = nil
+                        Task { await describeFrame([jpeg]) }
+                    }
+                    if narrationDue, let run = narrationRun {
+                        let sample = NarrationFrame(jpeg: jpeg, pixels: Self.comparisonPixels(image))
+                        let latestMotion = narrationFrames.last.map { Self.frameChange($0, sample) } ?? 0
+                        if latestMotion >= 0.45 {
+                            narrationSettlesAt = now + 1
+                        }
+                        narrationFrames.append(sample)
+                        nextNarrationFrameAt = now + 0.5
+                        if narrationFrames.count > 7 {
+                            narrationFrames.removeFirst()
+                        }
+                        if narrationFrames.count >= 3 && !isDescribing && !speechSynthesizer.isSpeaking &&
+                            now >= max(geminiRetryAt, nextNarrationRequestAt) {
+                            if now < narrationSettlesAt {
+                                narrationStatus = "Waiting for the view to settle…"
+                            } else {
+                                let reference = previousNarrationFrame
+                                let samples = narrationFrames
+                                let recentChanges = zip(samples, samples.dropFirst()).map {
+                                    Self.frameChange($0.0, $0.1)
+                                }
+                                let eventIndex = recentChanges.indices.dropLast().last {
+                                    recentChanges[$0] >= 0.02
+                                }
+                                let sceneChange = reference.map { Self.frameChange($0, sample) } ?? 1
+                                if eventIndex != nil || sceneChange >= 0.02 {
+                                    let sequence: [NarrationFrame]
+                                    if let eventIndex {
+                                        sequence = [samples[eventIndex], samples[eventIndex + 1], sample]
+                                    } else {
+                                        sequence = [reference ?? samples[0], samples[samples.count - 2], sample]
+                                    }
+                                    nextNarrationRequestAt = now + 15
+                                    narrationFrames = [sample]
+                                    narrationStatus = "Sending frames to Gemini…"
+                                    await describeFrame(sequence.map { $0.jpeg }, narration: run,
+                                                        sourceStream: id, capturedAt: now, reference: sample)
+                                } else {
+                                    narrationStatus = "Watching for changes…"
+                                }
+                            }
+                        }
+                    }
+                    if snapshotDue && photosAllowed {
+                        await savePhoto(jpeg, streamID: id)
+                    }
                 }
             }.store(in: streamListeners)
 
@@ -294,6 +432,235 @@ struct MyApp: App {
             stream.start()
         } catch {
             report("Camera error: \(error.localizedDescription)")
+        }
+    }
+
+    private struct NarrationFrame {
+        let jpeg: Data
+        let pixels: [UInt8]?
+    }
+
+    private static func comparisonPixels(_ image: UIImage) -> [UInt8]? {
+        guard let source = image.cgImage else { return nil }
+        let side = 32
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        let rendered = pixels.withUnsafeMutableBytes { bytes in
+            guard let context = CGContext(data: bytes.baseAddress, width: side, height: side,
+                                          bitsPerComponent: 8, bytesPerRow: side * 4,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+            context.interpolationQuality = .medium
+            context.draw(source, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
+        }
+        return rendered ? pixels : nil
+    }
+
+    private static func frameChange(_ first: NarrationFrame, _ second: NarrationFrame) -> Double {
+        guard let before = first.pixels, let after = second.pixels else { return 1 }
+        let changedPixels = stride(from: 0, to: before.count, by: 4).reduce(0) { count, offset in
+            let difference = (0..<3).map { abs(Int(before[offset + $0]) - Int(after[offset + $0])) }.max() ?? 0
+            return count + (difference >= 24 ? 1 : 0)
+        }
+        return Double(changedPixels) / Double(before.count / 4)
+    }
+
+    private static let geminiKeyQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: Bundle.main.bundleIdentifier ?? "AudibleEnvironment",
+        kSecAttrAccount as String: "gemini-api-key"
+    ]
+
+    private static func defaultGeminiKey() -> String {
+        if let url = Bundle.main.url(forResource: "LocalGeminiKey", withExtension: "txt"),
+           let key = try? String(contentsOf: url, encoding: .utf8) {
+            return key.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return loadGeminiKey()
+    }
+
+    private static func loadGeminiKey() -> String {
+        var query = geminiKeyQuery
+        query[kSecReturnData as String] = true
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func saveGeminiKey(_ code: String) -> OSStatus {
+        let attributes = [kSecValueData as String: Data(code.utf8)]
+        let status = SecItemUpdate(geminiKeyQuery as CFDictionary, attributes as CFDictionary)
+        guard status == errSecItemNotFound else { return status }
+        var item = geminiKeyQuery
+        item[kSecValueData as String] = attributes[kSecValueData as String]
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        return SecItemAdd(item as CFDictionary, nil)
+    }
+
+    private struct GeminiResponse: Decodable {
+        struct Candidate: Decodable {
+            struct Content: Decodable {
+                struct Part: Decodable {
+                    let text: String?
+                    let thought: Bool?
+                }
+
+                let parts: [Part]
+            }
+
+            let content: Content?
+        }
+
+        let candidates: [Candidate]?
+    }
+
+    private func speakDescription(_ description: String) {
+        do {
+            let audio = AVAudioSession.sharedInstance()
+            try audio.setCategory(.playback, mode: .spokenAudio)
+            try audio.setActive(true)
+            guard !speechSynthesizer.isSpeaking else { return }
+            speechSynthesizer.speak(AVSpeechUtterance(string: description))
+        } catch {
+            descriptionError = "Audio setup failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func requestDescription() {
+        let capture = UUID()
+        pendingCapture = capture
+        descriptionError = nil
+
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard pendingCapture == capture else { return }
+            pendingCapture = nil
+            descriptionError = "No frame arrived from the glasses. Check the stream and try again."
+        }
+    }
+
+    @MainActor
+    private func describeFrame(_ frames: [Data], narration: UUID? = nil, sourceStream: UUID? = nil, capturedAt: TimeInterval? = nil, reference: NarrationFrame? = nil) async {
+        guard !isDescribing else { return }
+        guard ProcessInfo.processInfo.systemUptime >= geminiRetryAt else {
+            descriptionError = "Gemini is on cooldown. Try again later."
+            return
+        }
+        descriptionError = nil
+        let key = geminiAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            if narration != nil { narrationStatus = "Enter your Gemini API key." }
+            descriptionError = "Enter your Gemini API key."
+            return
+        }
+
+        isDescribing = true
+        defer {
+            isDescribing = false
+            if let narration, narrationRun == narration, streamID == sourceStream,
+               narrationStatus == "Sending frames to Gemini…" {
+                narrationStatus = descriptionError == nil ? "Watching for changes…" : "Gemini request failed."
+            }
+        }
+
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent")!
+        var request = URLRequest(url: url, timeoutInterval: 45)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+
+        let manualPrompt = """
+        Describe this first-person camera image in one or two short sentences for a blind or low-vision person.
+        Lead with what people are holding up or visibly doing. If no person is visible, describe the main objects and layout. Only describe what is visible.
+        Say when the image is unclear. Do not give navigation instructions.
+        """
+        let narrationPrompt = """
+        Give a blind or low-vision listener one concrete detail visible in the latest image.
+        The images are chronological. Use earlier images to identify changes and actions.
+        Announce a useful detail if the recent announcements below do not already cover it.
+        A newly visible object, someone holding or pointing at something, a new action, or a new view
+        is worth describing even if it stays still across all frames. With no prior announcements,
+        describe the clearest useful detail in the current view.
+        Return exactly QUIET when the view is unusable or all useful visible details were already announced.
+        Ignore blur, lighting shifts, and head movement by itself. Describe only visible evidence.
+        Return a single phrase of at most ten words. Do not give navigation instructions.
+        Recent announcements:
+        \(recentAnnouncements.joined(separator: "\n"))
+        """
+        var parts: [[String: Any]] = [["text": narration == nil ? manualPrompt : narrationPrompt]]
+        for frame in frames {
+            parts.append(["inlineData": ["mimeType": "image/jpeg", "data": frame.base64EncodedString()]])
+        }
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["contents": [["parts": parts]]])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                descriptionError = "Gemini returned an invalid response."
+                return
+            }
+            if http.statusCode == 429 {
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
+                let delay = max(geminiBackoff, retryAfter.isFinite ? min(retryAfter, 86_400) : 0)
+                geminiRetryAt = ProcessInfo.processInfo.systemUptime + delay
+                geminiBackoff = min(geminiBackoff * 2, 900)
+                if narration != nil { narrationStatus = "Waiting for Gemini quota…" }
+                descriptionError = "Gemini reached its request limit. Paused for about \(Int(delay.rounded(.up))) seconds."
+                return
+            }
+            if let narration, narrationRun != narration || streamID != sourceStream || streamState != .streaming {
+                return
+            }
+            guard http.statusCode == 200 else {
+                switch http.statusCode {
+                case 400, 401, 403:
+                    descriptionError = "Gemini rejected the request (HTTP \(http.statusCode)). Check the API key and its permissions."
+                default:
+                    descriptionError = "Gemini returned HTTP \(http.statusCode)."
+                }
+                return
+            }
+            geminiBackoff = 60
+            let result = try JSONDecoder().decode(GeminiResponse.self, from: data)
+            let description = result.candidates?.first?.content?.parts
+                .filter { $0.thought != true }
+                .compactMap(\.text)
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let description, !description.isEmpty else {
+                descriptionError = "Gemini returned no description."
+                return
+            }
+            if narration != nil {
+                previousNarrationFrame = reference
+                let words = description.split { !$0.isLetter && !$0.isNumber }
+                if !words.isEmpty && words.allSatisfy({ $0.uppercased() == "QUIET" }) {
+                    narrationStatus = "Gemini replied. Nothing new to announce."
+                    return
+                }
+                guard words.count <= 10,
+                      let capturedAt,
+                      !speechSynthesizer.isSpeaking else { return }
+                guard ProcessInfo.processInfo.systemUptime - capturedAt <= 12 else {
+                    narrationStatus = "Gemini replied too late. Waiting for a fresh scene."
+                    return
+                }
+            }
+            do {
+                frameDescription = description
+                if narration != nil {
+                    recentAnnouncements = Array((recentAnnouncements + [description]).suffix(4))
+                    speakDescription(description)
+                }
+            }
+            if Self.saveGeminiKey(key) != errSecSuccess {
+                descriptionError = "The iPhone could not save the Gemini key in Keychain."
+            }
+        } catch {
+            if narration == nil || (narrationRun == narration && streamID == sourceStream) {
+                descriptionError = error.localizedDescription
+            }
         }
     }
 
