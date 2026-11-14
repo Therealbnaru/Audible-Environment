@@ -45,6 +45,7 @@ struct MyApp: App {
     @State private var isDescribing = false
     @State private var geminiRetryAt: TimeInterval = 0
     @State private var nextNarrationRequestAt: TimeInterval = 0
+    @State private var nextSceneRecheckAt: TimeInterval = 0
     @State private var narrationStatus = "Collecting frames…"
     @State private var geminiBackoff: TimeInterval = 60
 
@@ -404,7 +405,7 @@ struct MyApp: App {
                                     recentChanges[$0] >= 0.02
                                 }
                                 let sceneChange = reference.map { Self.frameChange($0, sample) } ?? 1
-                                if recentAnnouncements.isEmpty || eventIndex != nil || sceneChange >= 0.02 {
+                                if recentAnnouncements.isEmpty || eventIndex != nil || sceneChange >= 0.02 || now >= nextSceneRecheckAt {
                                     let sequence: [NarrationFrame]
                                     if let eventIndex {
                                         sequence = [samples[eventIndex], samples[eventIndex + 1], sample]
@@ -412,6 +413,7 @@ struct MyApp: App {
                                         sequence = [reference ?? samples[0], samples[samples.count - 2], sample]
                                     }
                                     nextNarrationRequestAt = now + 15
+                                    nextSceneRecheckAt = now + 30
                                     narrationFrames = [sample]
                                     narrationStatus = "Sending frames to Gemini…"
                                     await describeFrame(sequence.map { $0.jpeg }, narration: run,
@@ -582,7 +584,8 @@ struct MyApp: App {
         A newly visible object, someone holding or pointing at something, a new action, or a new view
         is worth describing even if it stays still across all frames. With no prior announcements,
         describe the clearest useful detail in the current view.
-        Return exactly QUIET when the view is unusable or all useful visible details were already announced.
+        Return exactly QUIET only when the view is unusable or the most useful current detail is already covered.
+        A different object held up by the same person is a new detail.
         Ignore blur, lighting shifts, and head movement by itself. Describe only visible evidence.
         Return a single phrase of at most ten words. Do not give navigation instructions.
         Recent announcements:
@@ -641,9 +644,9 @@ struct MyApp: App {
                 return
             }
             if narration != nil {
-                previousNarrationFrame = reference
                 let words = description.split { !$0.isLetter && !$0.isNumber }
                 if !words.isEmpty && words.allSatisfy({ $0.uppercased() == "QUIET" }) {
+                    previousNarrationFrame = reference
                     narrationStatus = recentAnnouncements.isEmpty
                         ? "Waiting for an initial description…"
                         : "Gemini replied. Nothing new to announce."
@@ -653,6 +656,7 @@ struct MyApp: App {
                 if recentAnnouncements.contains(where: {
                     $0.split { !$0.isLetter && !$0.isNumber }.map { $0.lowercased() } == normalized
                 }) {
+                    previousNarrationFrame = reference
                     narrationStatus = "Already announced."
                     return
                 }
@@ -667,6 +671,7 @@ struct MyApp: App {
             do {
                 frameDescription = description
                 if narration != nil {
+                    previousNarrationFrame = reference
                     recentAnnouncements = Array((recentAnnouncements + [description]).suffix(4))
                     speakDescription(description)
                 }
