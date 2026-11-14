@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from threading import Lock, Thread
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
 
 PORT = 8766
@@ -74,19 +74,29 @@ def main():
     root.title("Audible Environment Live Diagnostics")
     root.geometry("1100x800")
     hostname = subprocess.check_output(["/usr/sbin/scutil", "--get", "LocalHostName"], text=True).strip()
-    connection = ttk.Entry(root, width=72)
+    root.configure(bg="#eceff4")
+    connection = tk.Entry(root, width=72, fg="#172033", readonlybackground="#ffffff")
     connection.insert(0, f"Mac hostname: {hostname}.local    Viewer code: {CODE}")
     connection.configure(state="readonly")
     connection.pack(pady=8)
-    feed = ttk.LabelFrame(root, text="Live glasses view")
+    feed = tk.LabelFrame(root, bg="#eceff4", fg="#172033", text="Live glasses view")
     feed.pack(fill="x", padx=12, pady=4)
-    image_label = ttk.Label(feed, text="Waiting for glasses frames…")
+    image_label = tk.Label(feed, bg="#ffffff", fg="#172033", text="Waiting for glasses frames…")
     image_label.pack(pady=4)
-    sent = ttk.LabelFrame(root, text="Frames sent to Gemini")
+    sent = tk.LabelFrame(root, bg="#eceff4", fg="#172033", text="Frames sent to Gemini")
     sent.pack(fill="x", padx=12, pady=4)
     details = ScrolledText(root, wrap="word", state="disabled", height=12)
     details.pack(fill="both", expand=True, padx=12, pady=8)
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Receiver)
+    details.configure(bg="#ffffff", fg="#172033", state="normal")
+    details.insert("1.0", "Waiting for the first Gemini request…")
+    details.configure(state="disabled")
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Receiver)
+    except OSError as error:
+        messagebox.showerror("Could not start the viewer", f"Port {PORT}: {error}")
+        root.destroy()
+        return
+    print(f"Mac hostname: {hostname}.local | Viewer code: {CODE}", flush=True)
     Thread(target=server.serve_forever, daemon=True).start()
     shown = {}
     displayed_id = None
@@ -113,7 +123,7 @@ def main():
                         for child in sent.winfo_children():
                             child.destroy()
                         for index, image in enumerate(images, 1):
-                            label = ttk.Label(sent, text=f"Frame {index}", image=image, compound="top")
+                            label = tk.Label(sent, bg="#ffffff", fg="#172033", text=f"Frame {index}", image=image, compound="top")
                             label.image = image
                             label.pack(side="left", padx=5, pady=4)
                         displayed_id = exchange["id"]
