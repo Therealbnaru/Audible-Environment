@@ -3,6 +3,7 @@ import base64
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -10,7 +11,22 @@ import tempfile
 from threading import Lock, Thread
 
 PORT = 8766
-CODE = secrets.token_urlsafe(12)
+def viewer_code():
+    local = Path(__file__).resolve().parent.parent / "Audible Enviornment/LocalViewerCode.txt"
+    if local.is_file():
+        return local.read_text().strip()
+    directory = Path.home() / "Library/Application Support/Audible Environment"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / "viewer-code"
+    try:
+        with os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w") as file:
+            file.write(secrets.token_urlsafe(12))
+    except FileExistsError:
+        pass
+    return path.read_text().strip()
+
+
+CODE = viewer_code()
 lock = Lock()
 latest = {}
 
